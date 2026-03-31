@@ -127,18 +127,48 @@ def resample_closed_contour_uniform_px(contour_px, step_px):
 
 
 # =========================================================
-# Variable indexing
+# Variable indexing for TEB-style state
+# poses: x[0:n], y[0:n], beta[0:n], z_dt[0:n-1]
+# dt = dt_min + softplus(z_dt)
 # =========================================================
-def idx_x(i):
-    return 3 * i
+def idx_x(i, n):
+    return i
 
 
-def idx_y(i):
-    return 3 * i + 1
+def idx_y(i, n):
+    return n + i
 
 
-def idx_b(i):
-    return 3 * i + 2
+def idx_b(i, n):
+    return 2 * n + i
+
+
+def idx_dt(i, n):
+    return 3 * n + i
+
+
+def softplus(z):
+    return np.log1p(np.exp(-np.abs(z))) + np.maximum(z, 0.0)
+
+
+def sigmoid(z):
+    return 1.0 / (1.0 + np.exp(-z))
+
+
+def dt_from_z(z_dt, dt_min):
+    return dt_min + softplus(z_dt)
+
+
+def z_from_dt(dt, dt_min):
+    y = np.maximum(np.asarray(dt, dtype=float) - dt_min, 1e-6)
+    return np.log(np.expm1(y))
+
+
+def safe_unit(v):
+    l = float(np.linalg.norm(v))
+    if l <= 1e-12:
+        return np.zeros_like(v), 1e-12
+    return v / l, l
 
 
 # =========================================================
@@ -174,25 +204,34 @@ def build_esdf_cache(traj_xy, beta, robot, sdf, *, origin_xy, resolution):
 
 
 # =========================================================
-# Residual + analytic Jacobian builder
+# TEB-style residual + analytic Jacobian builder
 # =========================================================
-def build_residual_and_jacobian(
+def build_residual_and_jacobian_teb(
     traj_xy,
     beta,
+    z_dt,
     esdf_cache,
     *,
     weights,
     d_safe,
     d_edge,
-    delta_beta_max,
-    segment_length_max=None,
-    use_tangent=True,
+    dt_min,
+    teb_kappa=100.0,
+    v_max=0.5,
+    omega_max=1.0,
+    a_max=0.8,
+    alpha_max=2.0,
+    min_turning_radius=1.0,
 ):
     n = traj_xy.shape[0]
-    nv = 3 * n
+    m = n - 1
+    nv = 4 * n - 1
     rows = []
     jac_rows = []
     tags = []
+
+    dt = dt_from_z(z_dt, dt_min)
+    ddt_dz = sigmoid(z_dt)
 
     def add_row(residual, entries, tag):
         row = np.zeros(nv, dtype=float)
@@ -202,35 +241,42 @@ def build_residual_and_jacobian(
         jac_rows.append(row)
         tags.append(tag)
 
+    def add_hinge_row(value, grad_entries, limit, sqrt_w, tag):
+        excess = value - limit
+        if excess > 0.0 and sqrt_w > 0.0:
+            add_row(sqrt_w * excess, [(col, sqrt_w * g) for col, g in grad_entries], tag)
+
     sqrt_w_obs = np.sqrt(max(weights.get("obstacle", 0.0), 0.0))
     sqrt_w_edge = np.sqrt(max(weights.get("edge", 0.0), 0.0))
     sqrt_w_smooth = np.sqrt(max(weights.get("smooth", 0.0), 0.0))
     sqrt_w_h = np.sqrt(max(weights.get("h", 0.0), 0.0))
-    sqrt_w_tan = np.sqrt(max(weights.get("tangent", 0.0), 0.0))
-    sqrt_w_db = np.sqrt(max(weights.get("delta_beta_limit", 0.0), 0.0))
-    sqrt_w_segmax = np.sqrt(max(weights.get("segment_length_max", 0.0), 0.0))
-    sqrt_w_segeq = np.sqrt(max(weights.get("segment_length_equalize", 0.0), 0.0))
+    sqrt_w_time = np.sqrt(max(weights.get("time", 0.0), 0.0))
+    sqrt_w_v = np.sqrt(max(weights.get("velocity", 0.0), 0.0))
+    sqrt_w_omega = np.sqrt(max(weights.get("omega", 0.0), 0.0))
+    sqrt_w_a = np.sqrt(max(weights.get("accel", 0.0), 0.0))
+    sqrt_w_alpha = np.sqrt(max(weights.get("alpha", 0.0), 0.0))
+    sqrt_w_turn = np.sqrt(max(weights.get("turning_radius", 0.0), 0.0))
+    sqrt_w_dt_eq = np.sqrt(max(weights.get("dt_equalize", 0.0), 0.0))
 
-    # 1) Safety term: active-set hinge residuals
+    # 1) Safety term: active-set hinge residuals on all circle primitives
     if sqrt_w_obs > 0.0:
         for i in range(n):
             for pr in esdf_cache[i]:
                 d_eff = pr["d"] - pr["radius"]
                 if d_eff < d_safe:
-                    base = sqrt_w_obs * (d_eff - d_safe)
                     g = pr["g"]
                     jt = pr["J_theta"]
                     add_row(
-                        base,
+                        sqrt_w_obs * (d_eff - d_safe),
                         [
-                            (idx_x(i), sqrt_w_obs * g[0]),
-                            (idx_y(i), sqrt_w_obs * g[1]),
-                            (idx_b(i), sqrt_w_obs * float(g.dot(jt))),
+                            (idx_x(i, n), sqrt_w_obs * g[0]),
+                            (idx_y(i, n), sqrt_w_obs * g[1]),
+                            (idx_b(i, n), sqrt_w_obs * float(g.dot(jt))),
                         ],
                         "obstacle",
                     )
 
-    # 2) Edge band term on working primitive
+    # 2) Keep edge term for the working primitive
     if sqrt_w_edge > 0.0:
         for i in range(n):
             work = None
@@ -241,45 +287,19 @@ def build_residual_and_jacobian(
             if work is None:
                 continue
             d_eff = work["d"] - work["radius"]
-            base = sqrt_w_edge * (d_eff - d_edge)
             g = work["g"]
             jt = work["J_theta"]
             add_row(
-                base,
+                sqrt_w_edge * (d_eff - d_edge),
                 [
-                    (idx_x(i), sqrt_w_edge * g[0]),
-                    (idx_y(i), sqrt_w_edge * g[1]),
-                    (idx_b(i), sqrt_w_edge * float(g.dot(jt))),
+                    (idx_x(i, n), sqrt_w_edge * g[0]),
+                    (idx_y(i, n), sqrt_w_edge * g[1]),
+                    (idx_b(i, n), sqrt_w_edge * float(g.dot(jt))),
                 ],
                 "edge",
             )
 
-    # 3) Tangent motion term with frozen ESDF normal per iteration
-    if use_tangent and sqrt_w_tan > 0.0:
-        for k in range(n - 1):
-            work = None
-            for pr in esdf_cache[k]:
-                if pr["tag"] == "working":
-                    work = pr
-                    break
-            if work is None:
-                continue
-            g = work["g"]
-            n_hat = g / (np.linalg.norm(g) + 1e-12)
-            v = traj_xy[k + 1] - traj_xy[k]
-            vn = float(v.dot(n_hat))
-            add_row(
-                sqrt_w_tan * vn,
-                [
-                    (idx_x(k), -sqrt_w_tan * n_hat[0]),
-                    (idx_y(k), -sqrt_w_tan * n_hat[1]),
-                    (idx_x(k + 1), sqrt_w_tan * n_hat[0]),
-                    (idx_y(k + 1), sqrt_w_tan * n_hat[1]),
-                ],
-                "tangent",
-            )
-
-    # 4) Smoothness term: keep original second-difference form
+    # 3) Weak smoothness regularizer on positions only
     if sqrt_w_smooth > 0.0:
         for i in range(1, n - 1):
             rx = sqrt_w_smooth * (2.0 * traj_xy[i, 0] - traj_xy[i - 1, 0] - traj_xy[i + 1, 0])
@@ -287,128 +307,202 @@ def build_residual_and_jacobian(
             add_row(
                 rx,
                 [
-                    (idx_x(i - 1), -sqrt_w_smooth),
-                    (idx_x(i), 2.0 * sqrt_w_smooth),
-                    (idx_x(i + 1), -sqrt_w_smooth),
+                    (idx_x(i - 1, n), -sqrt_w_smooth),
+                    (idx_x(i, n), 2.0 * sqrt_w_smooth),
+                    (idx_x(i + 1, n), -sqrt_w_smooth),
                 ],
                 "smooth_x",
             )
             add_row(
                 ry,
                 [
-                    (idx_y(i - 1), -sqrt_w_smooth),
-                    (idx_y(i), 2.0 * sqrt_w_smooth),
-                    (idx_y(i + 1), -sqrt_w_smooth),
+                    (idx_y(i - 1, n), -sqrt_w_smooth),
+                    (idx_y(i, n), 2.0 * sqrt_w_smooth),
+                    (idx_y(i + 1, n), -sqrt_w_smooth),
                 ],
                 "smooth_y",
             )
 
-    # 5) Nonholonomic residual
-    if sqrt_w_h > 0.0:
-        for k in range(n - 1):
-            dx = traj_xy[k + 1, 0] - traj_xy[k, 0]
-            dy = traj_xy[k + 1, 1] - traj_xy[k, 1]
+    # Per-segment quantities used by multiple terms
+    v_vals = np.zeros(m, dtype=float)
+    w_vals = np.zeros(m, dtype=float)
+    dv_entries = []
+    dw_entries = []
 
+    for k in range(m):
+        seg = traj_xy[k + 1] - traj_xy[k]
+        u, seg_len = safe_unit(seg)
+        dx, dy = float(seg[0]), float(seg[1])
+        cb = float(np.cos(beta[k]))
+        sb = float(np.sin(beta[k]))
+        proj = cb * dx + sb * dy
+        kp = teb_kappa * proj
+        gamma = kp / (1.0 + abs(kp))
+        dgamma_dproj = teb_kappa / (1.0 + abs(kp)) ** 2
+
+        dt_k = float(dt[k])
+        inv_dt = 1.0 / max(dt_k, 1e-9)
+
+        dl = {
+            idx_x(k, n): -u[0],
+            idx_y(k, n): -u[1],
+            idx_x(k + 1, n): u[0],
+            idx_y(k + 1, n): u[1],
+        }
+        dproj = {
+            idx_x(k, n): -cb,
+            idx_y(k, n): -sb,
+            idx_x(k + 1, n): cb,
+            idx_y(k + 1, n): sb,
+            idx_b(k, n): -sb * dx + cb * dy,
+        }
+
+        dv_map = {}
+        for col, val in dl.items():
+            dv_map[col] = dv_map.get(col, 0.0) + gamma * inv_dt * val
+        for col, val in dproj.items():
+            dv_map[col] = dv_map.get(col, 0.0) + (seg_len * inv_dt * dgamma_dproj) * val
+        dv_map[idx_dt(k, n)] = dv_map.get(idx_dt(k, n), 0.0) - (seg_len * gamma) / (dt_k * dt_k) * ddt_dz[k]
+
+        v_k = seg_len * gamma * inv_dt
+        v_vals[k] = v_k
+        dv_entries.append(list(dv_map.items()))
+
+        dtheta = wrap_to_pi(beta[k + 1] - beta[k])
+        w_k = dtheta * inv_dt
+        w_vals[k] = w_k
+        dw_entries.append(
+            [
+                (idx_b(k, n), -inv_dt),
+                (idx_b(k + 1, n), inv_dt),
+                (idx_dt(k, n), -(dtheta / (dt_k * dt_k)) * ddt_dz[k]),
+            ]
+        )
+
+        # 4) Nonholonomic residual (keep strongly weighted)
+        if sqrt_w_h > 0.0:
             cbk = np.cos(beta[k])
             sbk = np.sin(beta[k])
             cbk1 = np.cos(beta[k + 1])
             sbk1 = np.sin(beta[k + 1])
-
             h = (cbk + cbk1) * dy - (sbk + sbk1) * dx
-
-            dh_dxk = sbk + sbk1
-            dh_dyk = -(cbk + cbk1)
-            dh_dxk1 = -(sbk + sbk1)
-            dh_dyk1 = cbk + cbk1
-            dh_dbk = (-sbk) * dy - cbk * dx
-            dh_dbk1 = (-sbk1) * dy - cbk1 * dx
-
             add_row(
                 sqrt_w_h * h,
                 [
-                    (idx_x(k), sqrt_w_h * dh_dxk),
-                    (idx_y(k), sqrt_w_h * dh_dyk),
-                    (idx_x(k + 1), sqrt_w_h * dh_dxk1),
-                    (idx_y(k + 1), sqrt_w_h * dh_dyk1),
-                    (idx_b(k), sqrt_w_h * dh_dbk),
-                    (idx_b(k + 1), sqrt_w_h * dh_dbk1),
+                    (idx_x(k, n), sqrt_w_h * (sbk + sbk1)),
+                    (idx_y(k, n), -sqrt_w_h * (cbk + cbk1)),
+                    (idx_x(k + 1, n), -sqrt_w_h * (sbk + sbk1)),
+                    (idx_y(k + 1, n), sqrt_w_h * (cbk + cbk1)),
+                    (idx_b(k, n), sqrt_w_h * ((-sbk) * dy - cbk * dx)),
+                    (idx_b(k + 1, n), sqrt_w_h * ((-sbk1) * dy - cbk1 * dx)),
                 ],
                 "nonholonomic",
             )
 
-    # 6) Delta-beta limit hinge residual
-    if sqrt_w_db > 0.0:
-        for k in range(n - 1):
-            d = wrap_to_pi(beta[k + 1] - beta[k])
-            abs_d = abs(d)
-            if abs_d > delta_beta_max:
-                sgn = 1.0 if d >= 0.0 else -1.0
-                res = sqrt_w_db * (abs_d - delta_beta_max)
-                add_row(
-                    res,
-                    [
-                        (idx_b(k), -sqrt_w_db * sgn),
-                        (idx_b(k + 1), sqrt_w_db * sgn),
-                    ],
-                    "delta_beta_limit",
-                )
-
-    # 7) Maximum segment length hinge residual
-    if sqrt_w_segmax > 0.0 and segment_length_max is not None:
-        for k in range(n - 1):
-            seg = traj_xy[k + 1] - traj_xy[k]
-            seg_len = float(np.linalg.norm(seg))
-            if seg_len > segment_length_max and seg_len > 1e-12:
-                u = seg / seg_len
-                res = sqrt_w_segmax * (seg_len - segment_length_max)
-                add_row(
-                    res,
-                    [
-                        (idx_x(k), -sqrt_w_segmax * u[0]),
-                        (idx_y(k), -sqrt_w_segmax * u[1]),
-                        (idx_x(k + 1), sqrt_w_segmax * u[0]),
-                        (idx_y(k + 1), sqrt_w_segmax * u[1]),
-                    ],
-                    "segment_length_max",
-                )
-
-    # 8) Segment length equalization residual
-    if sqrt_w_segeq > 0.0:
-        for k in range(n - 2):
-            v0 = traj_xy[k + 1] - traj_xy[k]
-            v1 = traj_xy[k + 2] - traj_xy[k + 1]
-            l0 = float(np.linalg.norm(v0))
-            l1 = float(np.linalg.norm(v1))
-            if l0 <= 1e-12 or l1 <= 1e-12:
-                continue
-            u0 = v0 / l0
-            u1 = v1 / l1
-            res = sqrt_w_segeq * (l1 - l0)
+        # 5) Minimum-time residual
+        if sqrt_w_time > 0.0:
             add_row(
-                res,
+                sqrt_w_time * dt_k,
+                [(idx_dt(k, n), sqrt_w_time * ddt_dz[k])],
+                "time",
+            )
+
+        # 6) Translational velocity hinge
+        if sqrt_w_v > 0.0:
+            sign_v = 1.0 if v_k >= 0.0 else -1.0
+            add_hinge_row(abs(v_k), [(c, sign_v * g) for c, g in dv_entries[-1]], v_max, sqrt_w_v, "velocity")
+
+        # 7) Angular velocity hinge
+        if sqrt_w_omega > 0.0:
+            sign_w = 1.0 if w_k >= 0.0 else -1.0
+            add_hinge_row(abs(w_k), [(c, sign_w * g) for c, g in dw_entries[-1]], omega_max, sqrt_w_omega, "omega")
+
+        # 8) Minimum turning radius hinge via curvature proxy |dtheta| <= seg_len / r_min
+        if sqrt_w_turn > 0.0 and min_turning_radius > 1e-9:
+            abs_db = abs(dtheta)
+            sign_db = 1.0 if dtheta >= 0.0 else -1.0
+            val = abs_db - seg_len / min_turning_radius
+            if val > 0.0:
+                entries = [
+                    (idx_b(k, n), -sign_db),
+                    (idx_b(k + 1, n), sign_db),
+                    (idx_x(k, n), u[0] / min_turning_radius),
+                    (idx_y(k, n), u[1] / min_turning_radius),
+                    (idx_x(k + 1, n), -u[0] / min_turning_radius),
+                    (idx_y(k + 1, n), -u[1] / min_turning_radius),
+                ]
+                add_row(sqrt_w_turn * val, [(c, sqrt_w_turn * g) for c, g in entries], "turning_radius")
+
+    # 9) Translational acceleration hinge
+    if sqrt_w_a > 0.0:
+        for k in range(m - 1):
+            denom = max(dt[k] + dt[k + 1], 1e-9)
+            a_k = 2.0 * (v_vals[k + 1] - v_vals[k]) / denom
+            sign_a = 1.0 if a_k >= 0.0 else -1.0
+            abs_a = abs(a_k)
+            if abs_a > a_max:
+                scale = 2.0 / denom
+                grad = {}
+                for c, g in dv_entries[k + 1]:
+                    grad[c] = grad.get(c, 0.0) + scale * g
+                for c, g in dv_entries[k]:
+                    grad[c] = grad.get(c, 0.0) - scale * g
+                coeff_denom = -2.0 * (v_vals[k + 1] - v_vals[k]) / (denom * denom)
+                grad[idx_dt(k, n)] = grad.get(idx_dt(k, n), 0.0) + coeff_denom * ddt_dz[k]
+                grad[idx_dt(k + 1, n)] = grad.get(idx_dt(k + 1, n), 0.0) + coeff_denom * ddt_dz[k + 1]
+                add_row(
+                    sqrt_w_a * (abs_a - a_max),
+                    [(c, sqrt_w_a * sign_a * g) for c, g in grad.items()],
+                    "accel",
+                )
+
+    # 10) Angular acceleration hinge
+    if sqrt_w_alpha > 0.0:
+        for k in range(m - 1):
+            denom = max(dt[k] + dt[k + 1], 1e-9)
+            alpha_k = 2.0 * (w_vals[k + 1] - w_vals[k]) / denom
+            sign_alpha = 1.0 if alpha_k >= 0.0 else -1.0
+            abs_alpha = abs(alpha_k)
+            if abs_alpha > alpha_max:
+                scale = 2.0 / denom
+                grad = {}
+                for c, g in dw_entries[k + 1]:
+                    grad[c] = grad.get(c, 0.0) + scale * g
+                for c, g in dw_entries[k]:
+                    grad[c] = grad.get(c, 0.0) - scale * g
+                coeff_denom = -2.0 * (w_vals[k + 1] - w_vals[k]) / (denom * denom)
+                grad[idx_dt(k, n)] = grad.get(idx_dt(k, n), 0.0) + coeff_denom * ddt_dz[k]
+                grad[idx_dt(k + 1, n)] = grad.get(idx_dt(k + 1, n), 0.0) + coeff_denom * ddt_dz[k + 1]
+                add_row(
+                    sqrt_w_alpha * (abs_alpha - alpha_max),
+                    [(c, sqrt_w_alpha * sign_alpha * g) for c, g in grad.items()],
+                    "alpha",
+                )
+
+    # 11) Optional weak temporal equalization / regularization
+    if sqrt_w_dt_eq > 0.0:
+        for k in range(m - 1):
+            add_row(
+                sqrt_w_dt_eq * (dt[k + 1] - dt[k]),
                 [
-                    (idx_x(k), sqrt_w_segeq * u0[0]),
-                    (idx_y(k), sqrt_w_segeq * u0[1]),
-                    (idx_x(k + 1), sqrt_w_segeq * (-u0[0] - u1[0])),
-                    (idx_y(k + 1), sqrt_w_segeq * (-u0[1] - u1[1])),
-                    (idx_x(k + 2), sqrt_w_segeq * u1[0]),
-                    (idx_y(k + 2), sqrt_w_segeq * u1[1]),
+                    (idx_dt(k, n), -sqrt_w_dt_eq * ddt_dz[k]),
+                    (idx_dt(k + 1, n), sqrt_w_dt_eq * ddt_dz[k + 1]),
                 ],
-                "segment_length_equalize",
+                "dt_equalize",
             )
 
     if not rows:
-        return np.zeros(0, dtype=float), np.zeros((0, nv), dtype=float), tags
+        return np.zeros(0, dtype=float), np.zeros((0, nv), dtype=float), tags, dt
 
     r = np.asarray(rows, dtype=float)
     J = np.vstack(jac_rows)
-    return r, J, tags
+    return r, J, tags, dt
 
 
 # =========================================================
 # LM optimizer with one ESDF pass per outer iteration
 # =========================================================
-def lm_optimize(
+def lm_optimize_teb(
     traj_xy,
     beta,
     robot,
@@ -419,29 +513,45 @@ def lm_optimize(
     d_safe,
     d_edge,
     weights,
+    dt_init,
+    dt_min=0.03,
+    teb_kappa=100.0,
+    v_max=0.5,
+    omega_max=1.0,
+    a_max=0.8,
+    alpha_max=2.0,
+    min_turning_radius=0.0,
     iters=100,
     history_stride=5,
-    delta_beta_max=np.radians(30.0),
-    segment_length_max=None,
     lambda0=1e-2,
     step_clip_xy=0.05,
     step_clip_beta=np.radians(10.0),
+    step_clip_dt_z=0.35,
 ):
     traj_xy = traj_xy.copy()
     beta = beta.copy()
     n = traj_xy.shape[0]
-    nv = 3 * n
+    m = n - 1
+    nv = 4 * n - 1
+
+    z_dt = z_from_dt(np.full(m, dt_init, dtype=float), dt_min)
 
     free_mask = np.ones(nv, dtype=bool)
     for i in [0, n - 1]:
-        free_mask[idx_x(i)] = False
-        free_mask[idx_y(i)] = False
-        free_mask[idx_b(i)] = False
+        free_mask[idx_x(i, n)] = False
+        free_mask[idx_y(i, n)] = False
+        free_mask[idx_b(i, n)] = False
 
     traj_history = [traj_xy.copy()]
     beta_history = [beta.copy()]
+    dt_history = [dt_from_z(z_dt, dt_min).copy()]
     obj_history = []
     lambda_lm = float(lambda0)
+
+    fixed_xy0 = traj_xy[0].copy()
+    fixed_xyN = traj_xy[-1].copy()
+    fixed_b0 = float(beta[0])
+    fixed_bN = float(beta[-1])
 
     for it in range(iters):
         esdf_cache = build_esdf_cache(
@@ -453,16 +563,21 @@ def lm_optimize(
             resolution=resolution,
         )
 
-        r, J, tags = build_residual_and_jacobian(
+        r, J, tags, dt = build_residual_and_jacobian_teb(
             traj_xy,
             beta,
+            z_dt,
             esdf_cache,
             weights=weights,
             d_safe=d_safe,
             d_edge=d_edge,
-            delta_beta_max=delta_beta_max,
-            segment_length_max=segment_length_max,
-            use_tangent=True,
+            dt_min=dt_min,
+            teb_kappa=teb_kappa,
+            v_max=v_max,
+            omega_max=omega_max,
+            a_max=a_max,
+            alpha_max=alpha_max,
+            min_turning_radius=min_turning_radius,
         )
 
         obj = 0.5 * float(r.dot(r)) if r.size else 0.0
@@ -472,12 +587,16 @@ def lm_optimize(
             counts = {}
             for t in tags:
                 counts[t] = counts.get(t, 0) + 1
-            print(f"Iter {it:4d} | obj={obj:.6e} | lambda={lambda_lm:.3e} | residuals={len(tags)} | active={counts}")
+            print(
+                f"Iter {it:4d} | obj={obj:.6e} | lambda={lambda_lm:.3e} | "
+                f"residuals={len(tags)} | active={counts} | dt=[{dt.min():.3f},{dt.max():.3f}]"
+            )
 
         if r.size == 0:
             if (it + 1) % history_stride == 0:
                 traj_history.append(traj_xy.copy())
                 beta_history.append(beta.copy())
+                dt_history.append(dt.copy())
             continue
 
         Jf = J[:, free_mask]
@@ -504,9 +623,10 @@ def lm_optimize(
         delta = np.zeros(nv, dtype=float)
         delta[free_mask] = delta_free
 
-        dx_step = delta[0::3]
-        dy_step = delta[1::3]
-        db_step = delta[2::3]
+        dx_step = delta[0:n]
+        dy_step = delta[n : 2 * n]
+        db_step = delta[2 * n : 3 * n]
+        dzdt_step = delta[3 * n :]
 
         step_xy_norm = np.sqrt(dx_step * dx_step + dy_step * dy_step)
         scale_xy = np.ones_like(step_xy_norm)
@@ -515,16 +635,18 @@ def lm_optimize(
         dx_step *= scale_xy
         dy_step *= scale_xy
         db_step = np.clip(db_step, -step_clip_beta, step_clip_beta)
+        dzdt_step = np.clip(dzdt_step, -step_clip_dt_z, step_clip_dt_z)
 
         traj_xy[:, 0] += dx_step
         traj_xy[:, 1] += dy_step
         beta = wrap_to_pi(beta + db_step)
+        z_dt += dzdt_step
 
         # Keep endpoints fixed exactly.
-        traj_xy[0] = traj_history[0][0]
-        traj_xy[-1] = traj_history[0][-1]
-        beta[0] = beta_history[0][0]
-        beta[-1] = beta_history[0][-1]
+        traj_xy[0] = fixed_xy0
+        traj_xy[-1] = fixed_xyN
+        beta[0] = fixed_b0
+        beta[-1] = fixed_bN
 
         # Mild damping schedule without extra ESDF calls in this iteration.
         lambda_lm = max(lambda_lm * 0.98, 1e-6)
@@ -532,8 +654,9 @@ def lm_optimize(
         if (it + 1) % history_stride == 0:
             traj_history.append(traj_xy.copy())
             beta_history.append(beta.copy())
+            dt_history.append(dt_from_z(z_dt, dt_min).copy())
 
-    return traj_xy, beta, traj_history, beta_history, obj_history
+    return traj_xy, beta, dt_from_z(z_dt, dt_min), traj_history, beta_history, dt_history, obj_history
 
 
 # =========================================================
@@ -561,22 +684,23 @@ def main():
 
     sample_step_m = 0.05
     sample_step_px = sample_step_m / resolution
-    segment_length_max = 1.6 * sample_step_m
 
     weights = {
-        "obstacle": 1.0,
-        "edge": 0.1,
-        "smooth": 0.001,
-        "h": 1.0,
-        # LM uses one clean nonholonomic residual weight.
-        "h_beta": 1000.0,
+        "obstacle": 10.0,
+        "edge": 0.05,
+        "smooth": 0.0005,
+        "h": 1000.0,
+        "time": 1.0,
+        "velocity": 1.0,
+        "omega": 1.0,
+        "accel": 1.0,
+        "alpha": 1.0,
+        "turning_radius": 1000.0,
+        "dt_equalize": 0.2,
         "tangent": 0.0,
-        "delta_beta_limit": 10.0,
-        "segment_length_max": 20.0,
-        "segment_length_equalize": 2.0,
     }
 
-    iters = 100
+    iters = 200
     history_stride = 5
 
     contour_px = extract_largest_contour_px(obstacle_mask)
@@ -590,7 +714,10 @@ def main():
     init_waypoints = traj_xy.copy()
     traj_initial = traj_xy.copy()
 
-    traj_final, beta_final, traj_history, beta_history, obj_history = lm_optimize(
+    nominal_speed = 0.25
+    dt_init = max(sample_step_m / nominal_speed, 0.10)
+
+    traj_final, beta_final, dt_final, traj_history, beta_history, dt_history, obj_history = lm_optimize_teb(
         traj_xy,
         beta,
         robot,
@@ -600,13 +727,20 @@ def main():
         d_safe=d_safe,
         d_edge=d_edge,
         weights=weights,
+        dt_init=dt_init,
+        dt_min=0.03,
+        teb_kappa=100.0,
+        v_max=0.50,
+        omega_max=0.8,
+        a_max=0.8,
+        alpha_max=2.0,
+        min_turning_radius=1.0,
         iters=iters,
         history_stride=history_stride,
-        delta_beta_max=np.radians(30.0),
-        segment_length_max=segment_length_max,
         lambda0=1e-2,
         step_clip_xy=0.05,
         step_clip_beta=np.radians(8.0),
+        step_clip_dt_z=0.35,
     )
 
     # -----------------------------
@@ -702,20 +836,27 @@ def main():
         scale_units="xy",
     )
 
-    ax.set_title("sim12: LM cached-ESDF + analytic Jacobian")
+    ax.set_title("sim12: LM cached-ESDF + TEB-style residuals")
     ax.axis("off")
     ax.legend(loc="best")
     plt.tight_layout()
     plt.show()
 
     np.savez(
-        "optimized_traj_lm_cached_analytic.npz",
+        "optimized_traj_lm_teb_style.npz",
         traj_xy=traj_final,
         beta=beta_final,
+        dt=dt_final,
+        traj_history=np.array(traj_history, dtype=float),
+        beta_history=np.array(beta_history, dtype=float),
+        dt_history=np.array(dt_history, dtype=float),
+        obj_history=np.array(obj_history, dtype=float),
         resolution=resolution,
         origin_xy=np.array(origin_xy),
     )
-    print("Saved optimized trajectory to optimized_traj_lm_cached_analytic.npz")
+    print("Saved optimized trajectory to optimized_traj_lm_teb_style.npz")
+    print(f"Final dt range: [{dt_final.min():.4f}, {dt_final.max():.4f}] s")
+    print(f"Approx total time: {dt_final.sum():.4f} s")
 
 
 if __name__ == "__main__":

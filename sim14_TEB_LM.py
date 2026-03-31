@@ -184,7 +184,7 @@ def build_residual_and_jacobian(
     weights,
     d_safe,
     d_edge,
-    delta_beta_max,
+    min_turning_radius=None,
     segment_length_max=None,
     use_tangent=True,
 ):
@@ -207,7 +207,7 @@ def build_residual_and_jacobian(
     sqrt_w_smooth = np.sqrt(max(weights.get("smooth", 0.0), 0.0))
     sqrt_w_h = np.sqrt(max(weights.get("h", 0.0), 0.0))
     sqrt_w_tan = np.sqrt(max(weights.get("tangent", 0.0), 0.0))
-    sqrt_w_db = np.sqrt(max(weights.get("delta_beta_limit", 0.0), 0.0))
+    sqrt_w_turn = np.sqrt(max(weights.get("min_turning_radius", 0.0), 0.0))
     sqrt_w_segmax = np.sqrt(max(weights.get("segment_length_max", 0.0), 0.0))
     sqrt_w_segeq = np.sqrt(max(weights.get("segment_length_equalize", 0.0), 0.0))
 
@@ -282,8 +282,12 @@ def build_residual_and_jacobian(
     # 4) Smoothness term: keep original second-difference form
     if sqrt_w_smooth > 0.0:
         for i in range(1, n - 1):
-            rx = sqrt_w_smooth * (2.0 * traj_xy[i, 0] - traj_xy[i - 1, 0] - traj_xy[i + 1, 0])
-            ry = sqrt_w_smooth * (2.0 * traj_xy[i, 1] - traj_xy[i - 1, 1] - traj_xy[i + 1, 1])
+            rx = sqrt_w_smooth * (
+                2.0 * traj_xy[i, 0] - traj_xy[i - 1, 0] - traj_xy[i + 1, 0]
+            )
+            ry = sqrt_w_smooth * (
+                2.0 * traj_xy[i, 1] - traj_xy[i - 1, 1] - traj_xy[i + 1, 1]
+            )
             add_row(
                 rx,
                 [
@@ -336,21 +340,33 @@ def build_residual_and_jacobian(
                 "nonholonomic",
             )
 
-    # 6) Delta-beta limit hinge residual
-    if sqrt_w_db > 0.0:
+    # 6) TEB-style minimum turning radius inequality
+    if sqrt_w_turn > 0.0 and min_turning_radius is not None and min_turning_radius > 0.0:
+        inv_rmin = 1.0 / float(min_turning_radius)
         for k in range(n - 1):
-            d = wrap_to_pi(beta[k + 1] - beta[k])
-            abs_d = abs(d)
-            if abs_d > delta_beta_max:
-                sgn = 1.0 if d >= 0.0 else -1.0
-                res = sqrt_w_db * (abs_d - delta_beta_max)
+            seg = traj_xy[k + 1] - traj_xy[k]
+            seg_len = float(np.linalg.norm(seg))
+            if seg_len > 1e-12:
+                u = seg / seg_len
+            else:
+                u = np.zeros(2, dtype=float)
+
+            d_beta = wrap_to_pi(beta[k + 1] - beta[k])
+            abs_d_beta = abs(d_beta)
+            violation = abs_d_beta - seg_len * inv_rmin
+            if violation > 0.0:
+                sgn = 1.0 if d_beta >= 0.0 else -1.0
                 add_row(
-                    res,
+                    sqrt_w_turn * violation,
                     [
-                        (idx_b(k), -sqrt_w_db * sgn),
-                        (idx_b(k + 1), sqrt_w_db * sgn),
+                        (idx_x(k), sqrt_w_turn * inv_rmin * u[0]),
+                        (idx_y(k), sqrt_w_turn * inv_rmin * u[1]),
+                        (idx_x(k + 1), -sqrt_w_turn * inv_rmin * u[0]),
+                        (idx_y(k + 1), -sqrt_w_turn * inv_rmin * u[1]),
+                        (idx_b(k), -sqrt_w_turn * sgn),
+                        (idx_b(k + 1), sqrt_w_turn * sgn),
                     ],
-                    "delta_beta_limit",
+                    "min_turning_radius",
                 )
 
     # 7) Maximum segment length hinge residual
@@ -421,7 +437,7 @@ def lm_optimize(
     weights,
     iters=100,
     history_stride=5,
-    delta_beta_max=np.radians(30.0),
+    min_turning_radius=None,
     segment_length_max=None,
     lambda0=1e-2,
     step_clip_xy=0.05,
@@ -460,7 +476,7 @@ def lm_optimize(
             weights=weights,
             d_safe=d_safe,
             d_edge=d_edge,
-            delta_beta_max=delta_beta_max,
+            min_turning_radius=min_turning_radius,
             segment_length_max=segment_length_max,
             use_tangent=True,
         )
@@ -472,7 +488,10 @@ def lm_optimize(
             counts = {}
             for t in tags:
                 counts[t] = counts.get(t, 0) + 1
-            print(f"Iter {it:4d} | obj={obj:.6e} | lambda={lambda_lm:.3e} | residuals={len(tags)} | active={counts}")
+            print(
+                f"Iter {it:4d} | obj={obj:.6e} | lambda={lambda_lm:.3e} | "
+                f"residuals={len(tags)} | active={counts}"
+            )
 
         if r.size == 0:
             if (it + 1) % history_stride == 0:
@@ -544,8 +563,7 @@ def main():
     origin_xy = (0.0, 0.0)
 
     obstacle_mask = load_occupancy_from_png(
-        # "l_shape_obstacle_30deg_longwall.png",
-        "l_shape_obstacle_45deg.png",  # --- IGNORE ---
+        "l_shape_obstacle_45deg.png",
         obstacle_is_dark=True,
         thresh=200,
     )
@@ -562,16 +580,15 @@ def main():
     sample_step_m = 0.05
     sample_step_px = sample_step_m / resolution
     segment_length_max = 1.6 * sample_step_m
+    min_turning_radius = 0.50
 
     weights = {
         "obstacle": 1.0,
         "edge": 0.1,
         "smooth": 0.001,
         "h": 1.0,
-        # LM uses one clean nonholonomic residual weight.
-        "h_beta": 1000.0,
         "tangent": 0.0,
-        "delta_beta_limit": 10.0,
+        "min_turning_radius": 10.0,
         "segment_length_max": 20.0,
         "segment_length_equalize": 2.0,
     }
@@ -602,16 +619,13 @@ def main():
         weights=weights,
         iters=iters,
         history_stride=history_stride,
-        delta_beta_max=np.radians(30.0),
+        min_turning_radius=min_turning_radius,
         segment_length_max=segment_length_max,
         lambda0=1e-2,
         step_clip_xy=0.05,
         step_clip_beta=np.radians(8.0),
     )
 
-    # -----------------------------
-    # Visualization
-    # -----------------------------
     fig, ax = plt.subplots(figsize=(8, 8))
 
     sdf_vis = sdf.copy()
@@ -702,20 +716,21 @@ def main():
         scale_units="xy",
     )
 
-    ax.set_title("sim12: LM cached-ESDF + analytic Jacobian")
+    ax.set_title("sim14: LM + TEB-style min turning radius")
     ax.axis("off")
     ax.legend(loc="best")
     plt.tight_layout()
     plt.show()
 
     np.savez(
-        "optimized_traj_lm_cached_analytic.npz",
+        "optimized_traj_teb_lm.npz",
         traj_xy=traj_final,
         beta=beta_final,
         resolution=resolution,
         origin_xy=np.array(origin_xy),
+        min_turning_radius=min_turning_radius,
     )
-    print("Saved optimized trajectory to optimized_traj_lm_cached_analytic.npz")
+    print("Saved optimized trajectory to optimized_traj_teb_lm.npz")
 
 
 if __name__ == "__main__":
